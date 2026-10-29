@@ -66,6 +66,7 @@ from max.serve.telemetry.common import (
     _telemetry_disabled,
     send_telemetry_log,
 )
+from max.serve.telemetry.gc_utils import freeze_gc_heap
 from max.serve.telemetry.metrics import METRICS
 from max.serve.telemetry.ttft_join import announce_enabled
 from max.serve.worker_interface import RequestQueueFull
@@ -265,6 +266,12 @@ async def lifespan(
                 model_worker=model_worker,
                 lora_queue=lora_queue,
             )
+
+        # As in the model worker, exclude long-lived startup objects from
+        # cyclic GC so full collections do not stall the request event loop.
+        # Objects allocated while serving still participate in normal GC.
+        frozen_objects = freeze_gc_heap()
+        logger.info("Froze %d GC-tracked API startup objects.", frozen_objects)
 
         logger.info(
             f"\n\n{'*' * 80}\n\n"

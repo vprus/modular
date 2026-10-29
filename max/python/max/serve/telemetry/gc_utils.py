@@ -126,9 +126,11 @@ def install_gc_debugger(
 def freeze_gc_heap() -> int:
     """Freezes all currently-tracked objects so GC never rescans them.
 
-    Intended to run once in the model worker after model init + graph-capture
-    warmup, before serving. The long-lived startup objects (weights, KV-cache
-    metadata, graph-capture state -- on the order of 10M+ objects for Kimi) are
+    Run once in each serving process after startup, before serving requests.
+    In the model worker this follows model init and graph-capture warmup; in
+    the API process it follows pipeline and handler initialization. The
+    long-lived startup objects (API metadata, weights, KV-cache metadata,
+    graph-capture state -- on the order of 10M+ objects for Kimi) are
     promoted to the oldest generation and then moved into CPython's permanent
     "frozen" set via :func:`gc.freeze`. Subsequent collections scan only
     objects allocated after this point, which drastically cuts the
