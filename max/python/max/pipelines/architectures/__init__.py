@@ -376,6 +376,11 @@ def register_all_models() -> None:
             "qwen3_embedding_modulev3_arch",
         ),
         _LazyArch(
+            "Qwen3ForCausalLM_PrefixCache_ModuleV3",
+            ".qwen3_embedding_modulev3.cached_arch",
+            "qwen3_cached_embedding_modulev3_arch",
+        ),
+        _LazyArch(
             "Qwen3VLForConditionalGeneration", ".qwen3vl_moe", "qwen3vl_arch"
         ),
         _LazyArch(

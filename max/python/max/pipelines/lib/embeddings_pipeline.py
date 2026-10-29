@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, final
+from typing import TYPE_CHECKING, Any, cast, final
 
 import numpy as np
 import numpy.typing as npt
@@ -28,8 +28,10 @@ from max.graph.weights import (
     load_weights,
     weights_format,
 )
+from max.nn.kv_cache import KVCacheParams, compute_num_device_blocks
 from max.nn.transformer import ReturnLogits
-from max.pipelines.context import BaseContextType
+from max.pipelines.context import BaseContextType, TextContext
+from max.pipelines.kv_cache.embedding_prefix_cache import EmbeddingPrefixCache
 from max.pipelines.modeling.types import (
     EmbeddingsContext,
     EmbeddingsGenerationInputs,
@@ -47,6 +49,7 @@ if TYPE_CHECKING:
 from max.support.algorithm import flatten2d
 
 from .interfaces import PipelineModel
+from .interfaces.pipeline_model import PipelineModelWithKVCache
 from .memory_estimation import MemoryPlan
 
 logger = logging.getLogger("max.pipelines")
@@ -104,7 +107,27 @@ class EmbeddingsPipeline(EmbeddingsPipelineType):
             ),
             return_logits=ReturnLogits.ALL,
             memory_plan=memory_plan,
+            max_batch_size=self._max_batch_size,
         )
+        self._kv_manager: EmbeddingPrefixCache | None = None
+        if isinstance(self._pipeline_model, PipelineModelWithKVCache):
+            params = cast(KVCacheParams, self._pipeline_model.kv_params)
+            budget = memory_plan.available_cache_memory
+            if budget is None:
+                raise ValueError("Cached embeddings require a KV memory budget")
+            pages = compute_num_device_blocks(
+                params=params,
+                available_cache_memory=budget - params.bytes_per_block,
+                max_batch_size=self._max_batch_size,
+                max_seq_len=self._pipeline_model.max_seq_len,
+                require_max_seq_len_fits=True,
+            )
+            self._kv_manager = EmbeddingPrefixCache(
+                params=params,
+                total_num_pages=pages,
+                session=session,
+                max_batch_size=self._max_batch_size,
+            )
 
     @property
     def max_batch_size(self) -> int:
@@ -121,6 +144,36 @@ class EmbeddingsPipeline(EmbeddingsPipelineType):
         Given a batch, executes the graph and returns the list of embedding
         outputs per request.
         """
+        manager = self._kv_manager
+        if manager is None:
+            return self._execute(inputs)
+        contexts: list[TextContext] = []
+        for batch in inputs.batches:
+            for ctx in batch.values():
+                if not isinstance(ctx, TextContext):
+                    raise ValueError(
+                        "Prefix caching requires text embedding contexts"
+                    )
+                contexts.append(ctx)
+        try:
+            for ctx in contexts:
+                manager.claim(ctx)
+                manager.alloc(ctx)
+            result = self._execute(inputs)
+            # _execute copies every result to the host. KV is now complete;
+            # failed forwards never publish their partially written pages.
+            for ctx in contexts:
+                manager.step(ctx)
+            return result
+        finally:
+            for ctx in contexts:
+                if manager.contains(ctx):
+                    manager.release(ctx)
+
+    def _execute(
+        self,
+        inputs: EmbeddingsGenerationInputs,
+    ) -> dict[RequestID, EmbeddingsGenerationOutput]:
         tracer: Tracer = Tracer()
         replica_batches = [
             list(replica_batch.values()) for replica_batch in inputs.batches
@@ -131,7 +184,12 @@ class EmbeddingsPipeline(EmbeddingsPipelineType):
         tracer.next("prepare_initial_token_inputs")
         # Prepare inputs for the first token in multistep execution.
         model_inputs = self._pipeline_model.prepare_initial_token_inputs(
-            replica_batches=replica_batches, kv_cache_inputs=None
+            replica_batches=replica_batches,
+            kv_cache_inputs=self._kv_manager.runtime_inputs(
+                cast(list[list[TextContext]], replica_batches)
+            )
+            if self._kv_manager is not None
+            else None,
         )
 
         tracer.next("execute")

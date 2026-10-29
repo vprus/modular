@@ -41,6 +41,7 @@ from max.pipelines.lib import (
     PipelineModel,
 )
 from max.pipelines.lib.interfaces.batch_processor import (
+    BatchProcessor,
     embedding_ragged_symbolic_inputs,
 )
 from max.pipelines.lib.memory_estimation import MemoryPlan
@@ -72,9 +73,9 @@ class Qwen3EmbeddingModel(PipelineModel[TextContext, None]):
     """
 
     model_config_cls: ClassVar[type[Any]] = Qwen3EmbeddingConfig
-    batch_processor_cls: ClassVar[
-        type[Qwen3EmbeddingModuleV3BatchProcessor]
-    ] = Qwen3EmbeddingModuleV3BatchProcessor
+    batch_processor_cls: ClassVar[type[BatchProcessor[Any, Any]]] = (
+        Qwen3EmbeddingModuleV3BatchProcessor
+    )
 
     model: Callable[..., Any]
     """Compiled model callable."""
