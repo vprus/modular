@@ -27,9 +27,11 @@ from unittest import mock
 import pytest
 from max.dtype import DType
 from max.graph import DeviceRef, Graph, TensorType, ops
+from max.nn.attention import MHAMaskVariant
 from max.nn.kernels import (
     _fp6_format_code,
     block_scaled_preshuffle_grouped_scale_4d,
+    flash_attention_ragged_gpu,
     grouped_dynamic_block_scaled_matmul_amd,
 )
 
@@ -319,3 +321,59 @@ def test_grouped_amd_matmul_rejects_an_ignored_a_scale_row_bound(
             a_scales_max_rows_per_expert=64,
             **kwargs,
         )
+
+
+def _ragged_attention_with_heads(
+    q_heads: int | str, k_heads: int | str, v_heads: int | str
+) -> None:
+    gpu = DeviceRef.GPU()
+    with Graph(
+        "ragged_attention_head_counts",
+        input_types=[
+            TensorType(DType.bfloat16, ("tokens", heads, 128), device=gpu)
+            for heads in (q_heads, k_heads, v_heads)
+        ]
+        + [
+            TensorType(DType.uint32, ("offsets",), device=gpu),
+            TensorType(DType.uint32, (1,), device=DeviceRef.CPU()),
+        ],
+    ) as graph:
+        q, k, v, offsets, maximum = (value.tensor for value in graph.inputs)
+        output = flash_attention_ragged_gpu(
+            q,
+            k,
+            v,
+            offsets,
+            maximum,
+            mask_variant=MHAMaskVariant.CAUSAL_MASK,
+            scale=128**-0.5,
+        )
+        assert output.shape == q.shape
+        graph.output(output)
+
+
+@pytest.mark.parametrize(
+    "q_heads, kv_heads", [(32, 32), (32, 8), (8, 1), ("heads", "heads")]
+)
+def test_ragged_attention_accepts_grouped_kv_heads(
+    q_heads: int | str, kv_heads: int | str
+) -> None:
+    _ragged_attention_with_heads(q_heads, kv_heads, kv_heads)
+
+
+@pytest.mark.parametrize(
+    "q_heads, k_heads, v_heads, message",
+    [
+        (32, 8, 4, "k and v must have same num_heads"),
+        (30, 8, 8, "positive integer multiple"),
+        (8, 32, 32, "positive integer multiple"),
+        (32, 0, 0, "positive integer multiple"),
+        (0, 8, 8, "positive integer multiple"),
+        ("q_heads", "kv_heads", "kv_heads", "statically known"),
+    ],
+)
+def test_ragged_attention_rejects_invalid_head_grouping(
+    q_heads: int | str, k_heads: int | str, v_heads: int | str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _ragged_attention_with_heads(q_heads, k_heads, v_heads)

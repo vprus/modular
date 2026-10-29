@@ -132,11 +132,13 @@ def test_causal_flash_attention_gpu(q_seqlen: int, k_seqlen: int) -> None:
     torch.testing.assert_close(out_max, out_flash_attn, rtol=1e-2, atol=2e-2)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def compute_ragged_max_flash_attn(
     gpu_session: InferenceSession,
     n_heads: int,
+    n_kv_heads: int,
     head_dim: int,
+    mask_variant: MHAMaskVariant,
 ) -> Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     torch.Tensor,
@@ -145,9 +147,14 @@ def compute_ragged_max_flash_attn(
     # total_seq_len, nheads, head_dim = q_ragged.shape
 
     # Graph types.
-    qkv_type = TensorType(
+    q_type = TensorType(
         dtype,
         shape=["total_seq_len", n_heads, head_dim],
+        device=DeviceRef.GPU(),
+    )
+    kv_type = TensorType(
+        dtype,
+        shape=["total_seq_len", n_kv_heads, head_dim],
         device=DeviceRef.GPU(),
     )
     input_row_offsets_type = TensorType(
@@ -162,9 +169,9 @@ def compute_ragged_max_flash_attn(
         with Graph(
             "ragged_flash_attn",
             input_types=[
-                qkv_type,
-                qkv_type,
-                qkv_type,
+                q_type,
+                kv_type,
+                kv_type,
                 input_row_offsets_type,
                 max_seq_len_type,
             ],
@@ -178,7 +185,7 @@ def compute_ragged_max_flash_attn(
                 v,
                 input_row_offsets,
                 max_seq_len,
-                mask_variant=MHAMaskVariant.NULL_MASK,
+                mask_variant=mask_variant,
                 scale=math.sqrt(1.0 / head_dim),
             )
             g.output(result)
@@ -210,17 +217,22 @@ def compute_ragged_max_flash_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lengths, n_heads, head_dim",
+    "seq_lengths, n_heads, n_kv_heads, head_dim, mask_variant",
     [
-        ([64, 64, 64, 16, 16, 4], 16, 128),  # Variable length sequences
-        ([100], 32, 128),  # Single sequence
-        ([256, 64], 16, 80),  # MiniMax M3 vision attention
+        ([64, 64, 64, 16, 16, 4], 16, 16, 128, MHAMaskVariant.NULL_MASK),
+        ([100], 32, 32, 128, MHAMaskVariant.NULL_MASK),
+        ([256, 64], 16, 16, 80, MHAMaskVariant.NULL_MASK),
+        ([68, 83, 97, 16], 32, 8, 128, MHAMaskVariant.NULL_MASK),
+        ([291, 68, 16], 32, 8, 128, MHAMaskVariant.CAUSAL_MASK),
     ],
+    scope="module",
 )
 def test_ragged_flash_attention_gpu(
     seq_lengths: list[int],
     n_heads: int,
+    n_kv_heads: int,
     head_dim: int,
+    mask_variant: MHAMaskVariant,
     compute_ragged_max_flash_attn: Callable[
         [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         torch.Tensor,
@@ -245,14 +257,14 @@ def test_ragged_flash_attention_gpu(
     )
     k_ragged = torch.randn(
         total_seq_len,
-        n_heads,
+        n_kv_heads,
         head_dim,
         dtype=torch_dtype,
         device=torch_device,
     )
     v_ragged = torch.randn(
         total_seq_len,
-        n_heads,
+        n_kv_heads,
         head_dim,
         dtype=torch_dtype,
         device=torch_device,
@@ -282,11 +294,15 @@ def test_ragged_flash_attention_gpu(
         k_single = k_ragged[start_idx:end_idx].unsqueeze(0)
         v_single = v_ragged[start_idx:end_idx].unsqueeze(0)
 
+        # Expand only in the independent reference; MAX receives native KV heads.
+        k_single = k_single.repeat_interleave(n_heads // n_kv_heads, dim=2)
+        v_single = v_single.repeat_interleave(n_heads // n_kv_heads, dim=2)
         out_single = scaled_dot_product_attention(
             q_single.permute(0, 2, 1, 3),
             k_single.permute(0, 2, 1, 3),
             v_single.permute(0, 2, 1, 3),
             scale=math.sqrt(1.0 / head_dim),
+            is_causal=mask_variant == MHAMaskVariant.CAUSAL_MASK,
         ).permute(0, 2, 1, 3)
         reference_outputs.append(out_single.squeeze(0))
 

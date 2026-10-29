@@ -119,12 +119,6 @@ class Qwen3AttentionNoCache(
         seq_lens = input_row_offsets[1:] - input_row_offsets[:-1]
         max_seq_len = F.max(seq_lens, axis=0)
 
-        # For GQA, expand K and V to match Q's number of heads
-        if self.n_kv_heads != self.n_heads:
-            n_rep = self.n_heads // self.n_kv_heads
-            xk = self._repeat_kv(xk, n_rep)
-            xv = self._repeat_kv(xv, n_rep)
-
         # Qwen3-Embedding uses causal masking by design (decoder-only encoder).
         # Unwrap max_seq_len to TensorValue so the v2 kernel's device
         # validation sees DeviceRef (Tensor.device returns Device which
@@ -143,12 +137,3 @@ class Qwen3AttentionNoCache(
 
         attn_out = F.reshape(attn_out, shape=[total_seq_len, -1])
         return self.o_proj(attn_out)
-
-    def _repeat_kv(self, x: Tensor, n_rep: int) -> Tensor:
-        """Repeat K or V tensors to match the number of query heads (for GQA)."""
-        if n_rep == 1:
-            return x
-
-        x_expanded = x.unsqueeze(2)
-        x_repeated = F.tile(x_expanded, [1, 1, n_rep, 1])
-        return x_repeated.reshape((-1, self.n_kv_heads * n_rep, self.head_dim))

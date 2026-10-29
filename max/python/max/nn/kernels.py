@@ -4900,12 +4900,16 @@ def flash_attention_ragged_gpu(
     """Computes flash attention for ragged inputs using a GPU-optimized
     kernel, without a KV cache.
 
+    Grouped-query attention uses each KV head for a group of query heads.
+    When head counts differ, they must be static and the query-head count
+    must be a positive integer multiple of the KV-head count.
+
     Args:
         q: The query tensor, of shape ``[total_seq_len, num_heads,
             head_dim]`` (ragged).
-        k: The key tensor, of shape ``[total_seq_len, num_heads,
+        k: The key tensor, of shape ``[total_seq_len, num_kv_heads,
             head_dim]`` (ragged).
-        v: The value tensor, of shape ``[total_seq_len, num_heads,
+        v: The value tensor, of shape ``[total_seq_len, num_kv_heads,
             head_dim]`` (ragged).
         input_row_offsets: The buffer of shape ``[batch_size + 1]`` with
             dtype uint32. Indicates where each sequence starts and ends in
@@ -5062,12 +5066,30 @@ def flash_attention_ragged_gpu(
             f"q: {q.shape[0]}, k: {k.shape[0]}, v: {v.shape[0]}"
         )
 
-    # Validate num_heads match
-    if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
+    q_heads, k_heads, v_heads = q.shape[1], k.shape[1], v.shape[1]
+    if k_heads != v_heads:
         raise ValueError(
-            "q, k, v must have same num_heads. Got "
-            f"q: {q.shape[1]}, k: {k.shape[1]}, v: {v.shape[1]}"
+            f"k and v must have same num_heads. Got k: {k_heads}, v: {v_heads}"
         )
+
+    # Preserve equal symbolic head counts, while requiring a known grouping
+    # when Q and KV differ. The GPU kernel derives this ratio at compile time.
+    if q_heads != k_heads:
+        if not isinstance(q_heads, StaticDim) or not isinstance(
+            k_heads, StaticDim
+        ):
+            raise ValueError(
+                "GQA requires statically known Q and KV head counts"
+            )
+        if (
+            int(q_heads) <= 0
+            or int(k_heads) <= 0
+            or int(q_heads) % int(k_heads)
+        ):
+            raise ValueError(
+                "q num_heads must be a positive integer multiple of kv num_heads. "
+                f"Got q: {q_heads}, kv: {k_heads}"
+            )
 
     # Validate input_row_offsets
     if input_row_offsets.dtype != DType.uint32:

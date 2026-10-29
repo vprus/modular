@@ -179,15 +179,7 @@ class Qwen3AttentionNoCache(Module):
         seq_lens = input_row_offsets[1:] - input_row_offsets[:-1]
         max_seq_len = ops.max(seq_lens, axis=0)
 
-        # Flash attention without cache
-        # Note: flash_attention_ragged_gpu expects all tensors to have same num_heads
-        # For GQA, we need to expand K and V to match Q's number of heads
-        if self.n_kv_heads != self.n_heads:
-            # Expand K and V by repeating along head dimension
-            n_rep = self.n_heads // self.n_kv_heads
-            xk = self._repeat_kv(xk, n_rep)
-            xv = self._repeat_kv(xv, n_rep)
-
+        # The ragged kernel handles grouped KV heads without repeating them.
         attn_out = flash_attention_ragged_gpu(
             q=xq,
             k=xk,
@@ -201,23 +193,3 @@ class Qwen3AttentionNoCache(Module):
         # Reshape back and apply output projection
         attn_out = ops.reshape(attn_out, shape=[total_seq_len, -1])
         return self.o_proj(attn_out)
-
-    def _repeat_kv(self, x: TensorValue, n_rep: int) -> TensorValue:
-        """Repeat K or V tensors to match the number of query heads (for GQA).
-
-        Args:
-            x: Input tensor of shape [total_seq_len, n_kv_heads, head_dim]
-            n_rep: Number of times to repeat each KV head
-
-        Returns:
-            Tensor of shape [total_seq_len, n_kv_heads * n_rep, head_dim]
-        """
-        if n_rep == 1:
-            return x
-
-        # Expand and reshape to repeat KV heads
-        # [seq_len, n_kv_heads, head_dim] -> [seq_len, n_kv_heads, n_rep, head_dim]
-        x_expanded = ops.unsqueeze(x, 2)
-        x_repeated = ops.tile(x_expanded, [1, 1, n_rep, 1])
-        # Reshape to [seq_len, n_kv_heads * n_rep, head_dim]
-        return x_repeated.reshape((-1, self.n_kv_heads * n_rep, self.head_dim))
