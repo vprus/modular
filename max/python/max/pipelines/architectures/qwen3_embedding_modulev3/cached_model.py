@@ -26,7 +26,10 @@ from max.experimental.nn import Module
 from max.experimental.tensor import Tensor, default_dtype
 from max.graph import DeviceRef
 from max.nn.attention import MHAMaskVariant
-from max.nn.kernels import flash_attention_ragged, rope_split_store_ragged
+from max.nn.kernels import (
+    flash_attention_ragged,
+    rope_split_store_ragged,
+)
 from max.nn.kv_cache import (
     KVCacheInputs,
     KVCacheInputsPerDevice,
@@ -152,7 +155,7 @@ class Qwen3CachedEmbeddingBatchProcessor(
 
 
 class Qwen3AttentionWithCache(Qwen3AttentionNoCache):
-    """Qwen Q/K normalization followed by native per-request RoPE and KV store."""
+    """Paged attention with a combined Q/K/V projection."""
 
     layer_idx: int
     kv_params: KVCacheParams
@@ -165,13 +168,18 @@ class Qwen3AttentionWithCache(Qwen3AttentionNoCache):
     ) -> Tensor:
         if kv_collection is None:
             return super().forward(x, input_row_offsets)
-        q = self.q_norm(
-            self.q_proj(x).reshape((-1, self.n_heads, self.head_dim))
+        # Preserve native checkpoint names. Constant-fold the weight concat,
+        # then project Q/K/V together to save two GEMM dispatches without the
+        # specialized paged-store GEMM epilogue. Keep per-head normalization
+        # and RoPE unchanged, including the BF16 normalization rounding order.
+        weight = F.concat(
+            [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], axis=0
         )
-        k = self.k_norm(
-            self.k_proj(x).reshape((-1, self.n_kv_heads, self.head_dim))
+        q, k, v = (x @ weight.T).split(
+            [self.q_weight_dim, self.kv_weight_dim, self.kv_weight_dim], axis=-1
         )
-        v = self.v_proj(x)
+        q = self.q_norm(q.reshape((-1, self.n_heads, self.head_dim)))
+        k = self.k_norm(k.reshape((-1, self.n_kv_heads, self.head_dim)))
         qkv = F.concat(
             [
                 q.reshape((-1, self.q_weight_dim)),
