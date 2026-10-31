@@ -32,8 +32,16 @@ Every claim is released when synchronous execution finishes or raises.
 
 This is a memory-heavy initial implementation for short requests: retaining a
 partial prefix still retains its physical page. Compact partial-page storage is
-future work. The general implementation returns the full embedding dimension;
-benchmark-specific dimension slicing belongs in the benchmark setup.
+future work. The graph returns the full embedding dimension. The native
+`/v1/embeddings` API supports Matryoshka truncation on the CPU before JSON
+serialization: set `is_matryoshka: true` in the checkpoint's `config.json`,
+then request, for example, `"dimensions": 512`. Only declare this capability
+for weights trained for Matryoshka embeddings, such as Qwen3-Embedding or the
+converted Qwen3-VL-Embedding text backbone. An optional
+`matryoshka_dimensions` list restricts the allowed sizes and also declares
+support. The API takes the requested prefix and L2-normalizes it; omitted
+dimensions preserve the full output. This does not reduce GPU computation
+or the full-dimensional transfer from the model worker.
 
 CPU ownership tests are in
 `max/tests/tests/pipelines/lib/test_embedding_prefix_cache.py`. GPU correctness

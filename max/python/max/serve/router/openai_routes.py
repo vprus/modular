@@ -1554,12 +1554,53 @@ class OpenAIChatResponseGenerator(
         ]
 
 
+def _validate_embedding_dimensions(
+    pipeline_config: PipelineConfig, dimensions: int
+) -> None:
+    """Reject resizing unless the pooled model declares Matryoshka support."""
+    model = pipeline_config.model
+    hf_config = model.huggingface_config
+    allowed = getattr(hf_config, "matryoshka_dimensions", None)
+    if not model.pool_embeddings or not (
+        getattr(hf_config, "is_matryoshka", False) or allowed
+    ):
+        raise InputError("This model does not support Matryoshka dimensions")
+    if allowed is not None and dimensions not in allowed:
+        raise InputError(f"dimensions must be one of {allowed}")
+    hidden_size = hf_config.get_text_config().hidden_size
+    if dimensions > hidden_size:
+        raise InputError(f"dimensions must not exceed {hidden_size}")
+
+
+def _embedding_values(
+    embedding: npt.NDArray[np.floating[Any]], dimensions: int | None
+) -> list[float]:
+    if dimensions is not None:
+        if embedding.ndim != 1:
+            raise RuntimeError("Matryoshka dimensions require a pooled vector")
+        if dimensions > embedding.shape[0]:
+            raise InputError(
+                f"dimensions must not exceed embedding size {embedding.shape[0]}"
+            )
+        # Cropping a normalized vector changes its length. Normalize the
+        # requested prefix again, without modifying the worker's output.
+        embedding = embedding[:dimensions].astype(np.float32)
+        norm = np.linalg.norm(embedding)
+        if not np.isfinite(norm) or norm <= 0:
+            raise RuntimeError("Cannot normalize a zero or nonfinite embedding")
+        embedding = embedding / norm
+    return embedding.tolist()
+
+
 class OpenAIEmbeddingsResponseGenerator:
     def __init__(self, pipeline: TokenGeneratorPipeline) -> None:
         self.pipeline = pipeline
 
     async def encode(
-        self, requests: list[TextGenerationRequest]
+        self,
+        requests: list[TextGenerationRequest],
+        *,
+        dimensions: int | None = None,
     ) -> CreateEmbeddingResponse:
         if len(requests) == 0:
             raise ValueError("No requests provided.")
@@ -1585,7 +1626,7 @@ class OpenAIEmbeddingsResponseGenerator:
                 Embedding(
                     object="embedding",
                     index=idx,
-                    embedding=list(output.embeddings),
+                    embedding=_embedding_values(output.embeddings, dimensions),
                 )
                 for idx, output in enumerate(embedding_outputs)
                 if output is not None
@@ -2823,6 +2864,11 @@ async def openai_create_embeddings(
             await request.body()
         )
         pipeline = get_pipeline(request, embeddings_request.model)
+        if embeddings_request.dimensions is not None:
+            _validate_embedding_dimensions(
+                get_app_pipeline_config(request.app),
+                embeddings_request.dimensions,
+            )
 
         logger.debug(
             "Processing path, %s, req-id, %s, for model, %s.",
@@ -2881,7 +2927,9 @@ async def openai_create_embeddings(
 
     # Second try-catch: response generation (server fault → 500)
     try:
-        response = await response_generator.encode(embedding_requests)
+        response = await response_generator.encode(
+            embedding_requests, dimensions=embeddings_request.dimensions
+        )
         # Returning the model makes FastAPI's generic encoder visit every
         # embedding scalar again in Python. The response is already validated;
         # serialize it directly to keep large vectors off that traversal path.

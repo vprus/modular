@@ -632,6 +632,7 @@ class CreateEmbeddingRequest(_EmbeddingParamsBase):  # type: ignore[misc,valid-t
 
     model: str
     input: str | list[str] | list[int] | list[list[int]]
+    dimensions: int | None = Field(default=None, strict=True, gt=0)
 
 
 class CreateSpeechRequest(_SpeechParamsBase):  # type: ignore[misc,valid-type]
