@@ -2882,7 +2882,13 @@ async def openai_create_embeddings(
     # Second try-catch: response generation (server fault → 500)
     try:
         response = await response_generator.encode(embedding_requests)
-        return response
+        # Returning the model makes FastAPI's generic encoder visit every
+        # embedding scalar again in Python. The response is already validated;
+        # serialize it directly to keep large vectors off that traversal path.
+        return Response(
+            content=response.model_dump_json(by_alias=True),
+            media_type="application/json",
+        )
     except RequestQueueFull:
         # Admission was rejected (full worker queue); let the central handler
         # map it to HTTP 429 rather than the generic 500 below.
